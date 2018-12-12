@@ -27,6 +27,7 @@ CONFIGURATION NODE LORA
 #include <stdio.h>
 #include <time.h>
 #include <wiringPi.h>
+#include <wiringSerial.h>
 #include <lmic.h>
 #include <hal.h>
 #include <local_hal.h>
@@ -41,8 +42,11 @@ CONFIGURATION NODE LORA
 /**************************************************************************
   VARIABLES AND DEFINITIONS
 **************************************************************************/
-u4_t cntr = 0;
-u1_t mydata[25];
+#define MAX_LEN  128
+u1_t in_buffer[2*MAX_LEN+1];
+uint8_t in_idx = 0;
+u1_t out_buffer[MAX_LEN+1];
+uint8_t out_idx = 0;
 
 /************************************************************************
   END DECLARATION Added and code continues
@@ -55,7 +59,7 @@ u1_t Nwkskey[16];
 u1_t Appskey[16];
 
 // Schedule TX every this many seconds (might become longer due to duty cycle limitations).
-int TX_INTERVAL = 30;
+int TX_INTERVAL = 15;
 
 // Convert u4_t in u1_t(array)
 #define msbf4_read(p) (u4_t) ((u4_t) (p)[0] << 24 | (u4_t) (p)[1] << 16 | (p)[2] << 8 | (p)[3])
@@ -81,6 +85,71 @@ lmic_pinmap pins =
   .dio ={RFM95_PIN_D0, RFM95_PIN_D1, UNUSED_PIN}, // D0, D1, D2(Not used)
 };
 
+int fds = -1;
+char serial_dev[16];
+
+	
+void serial_rw(void)
+{
+	
+  int i,j;
+ 
+	/* se não conectado, tenta conectar e envia estado da conexão */
+  if(fds < 0)
+  {
+	  for (i=0;i<4;i++)
+	  {
+		  serial_dev[11] = '0' + i;
+		  fprintf(stdout, "tentanto abrir porta %s\n", serial_dev);
+		  if ((fds = serialOpen (serial_dev, 115200)) >= 0)
+		  {
+			  printf("serial %d aberta \n", i);
+			  out_idx = 0;
+			  break;
+		  }
+	  }
+	  if(i==4)
+	  {
+		  out_buffer[0] = '?';	  
+		  out_idx = 1;
+	  }	  
+      
+	  
+  }
+  
+  /* se conectado, descarrega o buffer de entrada e recarrega o buffer de saída com dados, se houver, ou o estado da conexão */
+  if(fds >= 0 && out_idx == 0)
+  {
+	   if(in_idx > 0)
+	   {
+		   fprintf(stdout, "RX_BUFFER:");
+		   for(j=0;j<in_idx; j++)
+		   {
+			   serialPutchar (fds, in_buffer[j]);
+			   fprintf(stdout,"%c", in_buffer[j]);
+		   }
+		   fprintf(stdout,"\n\r");
+		   in_idx = 0;		   
+	   }
+	   
+	   while (serialDataAvail (fds))
+	   {
+		   out_buffer[out_idx++]  = serialGetchar (fds);
+		   if(out_idx == MAX_LEN)
+		   {
+			   break;
+		   }   		   
+	   }
+	   
+	   if(out_idx == 0)
+	   {
+		   out_buffer[0] = '!';	
+		   out_buffer[1] = serial_dev[11];		   
+		   out_idx = 2;
+	   }	   
+  }
+}
+
 void onEvent(ev_t ev)
 {
   switch (ev)
@@ -93,25 +162,34 @@ void onEvent(ev_t ev)
       fprintf(stdout, "Event EV_TXCOMPLETE, time: %d\n", millis() / 1000);
 
       // Check ACK
-      if (LMIC.txrxFlags & TXRX_ACK) fprintf(stdout, "Received ACK!\n");
+      if (LMIC.txrxFlags & TXRX_ACK) 
+	  {
+		  fprintf(stdout, "Received ACK!\n");
+		  out_idx = 0;
+	  }
       else if (LMIC.txrxFlags & TXRX_NACK)  fprintf(stdout, "No ACK received!\n");
 
       // Check DOWN
-      if (LMIC.dataLen)
+      if (LMIC.dataLen && LMIC.dataLen <= 2*MAX_LEN)
       {
 
-	fprintf(stdout, "RSSI: ");
-	fprintf(stdout, "%ld", LMIC.rssi - 96);
-	fprintf(stdout, " dBm\n");
+		fprintf(stdout, "RSSI: ");
+		fprintf(stdout, "%ld", LMIC.rssi - 96);
+		fprintf(stdout, " dBm\n");
 
-	fprintf(stdout, "SNR: ");
-	fprintf(stdout, "%ld", LMIC.snr * 0.25);
-	fprintf(stdout, " dB\n");
+		fprintf(stdout, "SNR: ");
+		fprintf(stdout, "%ld", LMIC.snr * 0.25);
+		fprintf(stdout, " dB\n");
 
-	fprintf(stdout, "Data Received!\n");
+		fprintf(stdout, "Data Received!\n");	
+		
+		in_idx = 0;
         for (int i = 0; i < LMIC.dataLen; i++)
         {
           fprintf(stdout, "0x%02x ", LMIC.frame[LMIC.dataBeg + i]);
+
+		  in_buffer[in_idx++] = LMIC.frame[LMIC.dataBeg + i];
+			  
         }
         fprintf(stdout, "\n");
       }
@@ -122,29 +200,30 @@ void onEvent(ev_t ev)
   }
 }
 
+
 static void do_send(osjob_t * j)
 {
   time_t t = time(NULL);
   fprintf(stdout, "[%x] (%ld) %s\n", hal_ticks(), t, ctime(& t));
+  
+  serial_rw();
+  
   // Show TX channel (channel numbers are local to LMIC)
   // Check if there is not a current TX/RX job running
   if (LMIC.opmode & OP_TXRXPEND)
   {
-    fprintf(stdout, "OP_TXRXPEND, not sending");
+    fprintf(stdout, "OP_TXRXPEND, not sending\n");
   }
   else
   {
     // Prepare upstream data transmission at the next possible time.
-    char buf[25];
-    sprintf(buf, "Hello world! [%d]", cntr++);
-    int i = 0;
-    while (buf[i])
-    {
-      mydata[i] = buf[i];
-      i++;
-    }
-    mydata[i] = '\0';
-    LMIC_setTxData2(1, mydata, strlen(buf), 0);
+	#define CONFIRMED 1
+	if(out_idx > 0)
+	{
+		out_buffer[out_idx] = '\0';
+		fprintf(stdout, "TX_BUFFER: %s\n", out_buffer);
+		LMIC_setTxData2(SESSION_PORT, out_buffer, out_idx, CONFIRMED);		
+	}    
   }
   // Schedule a timed job to run at the given timestamp (absolute system time)
   os_setTimedCallback(j, os_getTime() + sec2osticks(TX_INTERVAL), do_send);
@@ -231,6 +310,8 @@ void setup()
 {
   int i;
   
+  strcpy(serial_dev,"/dev/ttyUSBx");
+	
   //wiringPi init
   wiringPiSetup();
 
@@ -261,9 +342,11 @@ void setup()
   printf("\n");
 
   printf("\nCopied from file in read operation!==========By Luiz Odilon\n");
+  
 /***************************************************************************
     END HANDLER OPERATIONS AND THE CODE continues
 /**************************************************************************/
+
 
   // Set static session parameters. Instead of dynamically establishing a session
   // by joining the network, precomputed session parameters are be provided.
@@ -311,18 +394,23 @@ void setup()
   //Add thread
   //piThreadCreate (blinkRun);
 
-    // Start job
+  // Start job
   do_send(& sendjob);
 }
 
+
 void loop()
 {
-  os_runloop();
+  
+  os_runloop();  
+  
 }
 
+ 
 int main()
 {
   setup();
+
   while (1)
   {
    loop();
